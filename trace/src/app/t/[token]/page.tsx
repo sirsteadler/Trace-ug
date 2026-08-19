@@ -53,11 +53,8 @@ export default async function TrackingPage({
     );
   }
 
-  return (
-    <TrackingView
-      deliveryId={link.deliveryId}
-      jwt={link.jwt}
-      expiresAt={link.expiresAt}
-    />
-  );
+  // The token goes to the client deliberately: it is the bearer credential the
+  // recipient already holds, and the browser exchanges it for a bound session.
+  // Nothing about the delivery travels with it.
+  return <TrackingView token={token} />;
 }

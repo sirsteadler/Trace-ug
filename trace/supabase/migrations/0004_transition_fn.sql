@@ -107,20 +107,18 @@ begin
   -- GUARD 1: actor authorisation. First, so an unauthorised caller learns
   -- nothing about delivery state (FR-STM-008).
   --
-  -- Two identity sources. Staff and riders arrive as Supabase users. Recipients
-  -- have no account at all and arrive holding a scoped tracking JWT whose
-  -- tracking_delivery_id claim names the one delivery they may act on.
-  v_track_claim := nullif(
-    current_setting('request.jwt.claims', true)::jsonb ->> 'tracking_delivery_id', ''
-  )::uuid;
+  -- Two identity sources, both of them real Supabase sessions. Staff and riders
+  -- have a profile row. Recipients sign in anonymously and hold no profile at
+  -- all — their authority comes from a tracking_sessions binding created by
+  -- claim_tracking_token(), which names the one delivery they may act on.
+  if auth.uid() is null then
+    perform raise_trace_error('UNAUTHENTICATED');
+  end if;
 
-  if auth.uid() is not null then
-    select role, org_id into v_role, v_org
-      from profiles where id = auth.uid() and is_active;
-    if v_role is null then
-      perform raise_trace_error('UNAUTHENTICATED');
-    end if;
+  select role, org_id into v_role, v_org
+    from profiles where id = auth.uid() and is_active;
 
+  if v_role is not null then
     -- Mapped explicitly. `case when rider then rider else admin` collapses every
     -- other role — including `sender`, which exists in user_role — into full
     -- admin transition rights over every delivery in the database.
@@ -133,10 +131,12 @@ begin
     if v_actor is null then
       perform raise_trace_error('FORBIDDEN_ACTOR');
     end if;
-  elsif v_track_claim is not null then
-    v_actor := 'recipient'::actor_type;
   else
-    perform raise_trace_error('UNAUTHENTICATED');
+    v_track_claim := tracking_delivery();
+    if v_track_claim is null then
+      perform raise_trace_error('UNAUTHENTICATED');
+    end if;
+    v_actor := 'recipient'::actor_type;
   end if;
 
   -- FOR UPDATE. Without the lock two concurrent calls both read ARRIVED, both

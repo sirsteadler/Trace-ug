@@ -3,10 +3,10 @@
 /**
  * Live tracking for the recipient. SRS §5.3.2, FR-CNF-001.
  *
- * The scoped JWT is passed from the server and used for both PostgREST and
- * Realtime, so RLS — not this component — decides what is visible. If a policy
- * is wrong, this screen goes blank rather than leaking; that is the intended
- * failure direction.
+ * Sign in anonymously, exchange the link token for a session binding, then read
+ * one delivery over Realtime. RLS — not this component — decides what is
+ * visible; if a policy is wrong the screen goes blank rather than leaking, which
+ * is the intended failure direction.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
@@ -15,18 +15,11 @@ interface Delivery {
   id: string;
   trace_id: string;
   status: string;
-  recipient_name: string | null;
   destination_address: string | null;
   eta_at: string | null;
 }
 
-interface RiderPosition {
-  lat: number;
-  lng: number;
-  updated_at: string;
-}
-
-/** Plain language, because the recipient is not reading a state machine. */
+/** Plain language: the recipient is not reading a state machine. */
 const STATUS_COPY: Record<string, string> = {
   CREATED: 'Your delivery is being prepared',
   ASSIGNED: 'A rider has been assigned',
@@ -41,80 +34,93 @@ const STATUS_COPY: Record<string, string> = {
   RETURNED: 'This delivery is being returned',
 };
 
-export function TrackingView({
-  deliveryId,
-  jwt,
-  expiresAt,
-}: {
-  deliveryId: string;
-  jwt: string;
-  expiresAt: number;
-}) {
+export function TrackingView({ token }: { token: string }) {
   const supabase = useMemo(
     () =>
       createClient(
         process.env.NEXT_PUBLIC_SUPABASE_URL!,
         process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-        {
-          auth: { persistSession: false, autoRefreshToken: false },
-          // Both PostgREST and Realtime read the scoped token from here.
-          accessToken: async () => jwt,
-        },
       ),
-    [jwt],
+    [],
   );
 
+  const [deliveryId, setDeliveryId] = useState<string | null>(null);
   const [delivery, setDelivery] = useState<Delivery | null>(null);
-  const [position, setPosition] = useState<RiderPosition | null>(null);
+  const [riderMoving, setRiderMoving] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [expired, setExpired] = useState(false);
+  const [fatal, setFatal] = useState<string | null>(null);
 
-  // The grant is short-lived and cannot be revoked once minted, so the page
-  // stops itself rather than sitting on a stale view of a live delivery.
+  // Claim once: anonymous session, then bind it to this one delivery.
   useEffect(() => {
-    const remaining = expiresAt - Date.now();
-    if (remaining <= 0) {
-      setExpired(true);
-      return;
-    }
-    const timer = setTimeout(() => setExpired(true), remaining);
-    return () => clearTimeout(timer);
-  }, [expiresAt]);
+    let cancelled = false;
+
+    (async () => {
+      const { data: existing } = await supabase.auth.getSession();
+      if (!existing.session) {
+        const { error: signInError } = await supabase.auth.signInAnonymously();
+        if (signInError) {
+          if (!cancelled) {
+            setFatal(
+              signInError.message.toLowerCase().includes('disabled')
+                ? 'Tracking is not available yet. Anonymous sign-in is switched off for this project.'
+                : 'We could not open your delivery. Please try again shortly.',
+            );
+          }
+          return;
+        }
+      }
+
+      const { data, error: claimError } = await supabase.rpc('claim_tracking_token', {
+        p_token: token,
+      });
+
+      if (cancelled) return;
+      if (claimError || !data) {
+        setFatal('This tracking link is no longer valid.');
+        return;
+      }
+      setDeliveryId(data as string);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [supabase, token]);
 
   const load = useCallback(async () => {
+    if (!deliveryId) return;
     const { data } = await supabase
       .from('deliveries')
-      .select('id, trace_id, status, recipient_name, destination_address, eta_at')
+      .select('id, trace_id, status, destination_address, eta_at')
       .eq('id', deliveryId)
       .maybeSingle();
     if (data) setDelivery(data as Delivery);
   }, [supabase, deliveryId]);
 
   useEffect(() => {
+    if (!deliveryId) return;
     void load();
 
     const channel = supabase
       .channel(`track:${deliveryId}`)
       .on(
         'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'deliveries', filter: `id=eq.${deliveryId}` },
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'deliveries',
+          filter: `id=eq.${deliveryId}`,
+        },
         () => void load(),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'rider_positions' },
-        (payload) => {
-          const row = payload.new as Partial<RiderPosition> | null;
-          // RLS already limits this to the rider on this delivery, and only
-          // while the delivery is in a state the recipient may watch.
-          if (row?.lat != null && row?.lng != null) {
-            setPosition({
-              lat: Number(row.lat),
-              lng: Number(row.lng),
-              updated_at: String(row.updated_at ?? ''),
-            });
-          }
+        () => {
+          // RLS limits this to the rider on this delivery, and only while the
+          // delivery is in a state the recipient may watch.
+          setRiderMoving(true);
         },
       )
       .subscribe();
@@ -125,6 +131,7 @@ export function TrackingView({
   }, [supabase, deliveryId, load]);
 
   const confirmReceipt = useCallback(async () => {
+    if (!deliveryId) return;
     setConfirming(true);
     setError(null);
 
@@ -140,10 +147,11 @@ export function TrackingView({
     });
 
     if (rpcError) {
+      const message = rpcError.message;
       setError(
-        rpcError.message.includes('OUTSIDE_GEOFENCE')
+        message.includes('OUTSIDE_GEOFENCE')
           ? 'Your rider does not appear to be at the delivery address yet.'
-          : rpcError.message.includes('POSITION_REQUIRED')
+          : message.includes('POSITION_REQUIRED')
             ? 'We cannot see your rider’s location right now. Please try again shortly.'
             : 'That did not go through. Please try again.',
       );
@@ -155,12 +163,10 @@ export function TrackingView({
     setConfirming(false);
   }, [supabase, deliveryId, load]);
 
-  if (expired) {
+  if (fatal) {
     return (
       <Shell>
-        <p className="text-center text-mist-400">
-          This view has timed out. Reopen the link from your message to continue.
-        </p>
+        <p className="text-center text-mist-400">{fatal}</p>
       </Shell>
     );
   }
@@ -198,12 +204,10 @@ export function TrackingView({
       )}
 
       {delivery.destination_address && (
-        <p className="wrap-hard mt-6 text-sm text-mist-400">
-          {delivery.destination_address}
-        </p>
+        <p className="wrap-hard mt-6 text-sm text-mist-400">{delivery.destination_address}</p>
       )}
 
-      {position && !done && (
+      {riderMoving && !done && (
         <p className="mt-6 rounded-xl bg-ink-800 px-4 py-3 text-sm text-mist-200">
           Rider position updating live
         </p>
