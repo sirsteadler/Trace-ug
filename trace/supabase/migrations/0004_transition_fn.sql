@@ -32,7 +32,9 @@ values
   ('T-07','AT_PICKUP','PICKED_UP','{rider}',           true, false,false,false),
   ('T-08','PICKED_UP','IN_TRANSIT','{rider,system}',   true, false,false,false),
   ('T-09','IN_TRANSIT','ARRIVED', '{rider}',           true, false,false,false),
-  ('T-10','ARRIVED','DELIVERED',  '{rider}',           true, true, true, false),
+  -- FR-CNF-001: the recipient's tap is what closes a Tier 1 delivery, so the
+  -- recipient is an actor here, not only at T-11.
+  ('T-10','ARRIVED','DELIVERED',  '{rider,recipient}', true, true, true, false),
   -- FR-CNF-005: a Tier 3 close lands on DELIVERED, and the recipient's later
   -- reply to the asynchronous SMS is what carries it to CONFIRMED.
   ('T-11','DELIVERED','CONFIRMED','{recipient,system}',false,false,false,false),
@@ -201,6 +203,21 @@ begin
   v_lat      := nullif(payload#>>'{position,lat}','')::numeric;
   v_lng      := nullif(payload#>>'{position,lng}','')::numeric;
   v_accuracy := nullif(payload#>>'{position,accuracy_m}','')::numeric;
+
+  -- A recipient's own position is irrelevant and untrusted: the geofence asks
+  -- where the RIDER is, and the recipient is merely the one asserting receipt.
+  -- Their tap therefore borrows the rider's last live fix, which must be recent
+  -- enough to still describe the handover rather than an earlier part of the trip.
+  if v_actor = 'recipient' then
+    select lat, lng, accuracy_m into v_lat, v_lng, v_accuracy
+      from rider_positions
+     where rider_id = v_delivery.assigned_rider_id
+       and updated_at > now() - interval '10 minutes';
+    if not found then
+      perform raise_trace_error('POSITION_REQUIRED',
+        '{"reason":"no recent rider position to validate against"}'::jsonb);
+    end if;
+  end if;
 
   if v_rule.requires_position and (v_lat is null or v_lng is null) then
     perform raise_trace_error('POSITION_REQUIRED');
