@@ -87,14 +87,16 @@ purge must clear anything older than an hour regardless of send state.
 
 ## High
 
-### H1 — `sync_queue` is all-or-nothing across *all* deliveries
-`0004_transition_fn.sql:279-304`
+### ~~H1 — `sync_queue` is all-or-nothing across *all* deliveries~~ — WITHDRAWN
 
-The approved design is atomic **per delivery**, so a bad chain on TRC-2044 cannot block
-TRC-2048. This implementation wraps every action in one transaction, so a single rejected
-action discards a whole shift's queued work across every delivery in the batch.
+**Withdrawn after reading `TRACE_SRS_v1.0.pdf` §4.4.** FR-STM-010 replays a queue "as one
+batch identified by a batch identifier"; FR-STM-011 requires that "a batch containing an
+illegal step shall be rejected in whole; no partial chain is written."
 
-**Fix:** group by `delivery_id` and call once per group, or have the client batch per delivery.
+The implementation is correct. **The approved design specification's per-delivery atomicity is
+the deviation**, and it should be amended to match the SRS. The operational concern stands —
+one bad action does discard a shift's queued work across every delivery — but that is a
+deliberate requirement, not a defect.
 
 ### H2 — Chain failures lose their error code and index
 `0004_transition_fn.sql:298-303`
@@ -190,6 +192,52 @@ unreliable position should require the PIN, not merely a non-tap tier.
 Management dashboard · customer tracking page · SAP adapter · SMS worker Edge Function
 (`outbound_sms` rows accumulate with nothing sending them) · map rendering · Web Push and its
 subscription table · health computation · shift-end position deletion.
+
+---
+
+## Addendum — after reading `TRACE_SRS_v1.0.pdf`
+
+The SRS was located at `Desktop\trace\TRACE_SRS_v1.0.pdf` after this audit was first written.
+It is a genuine 2,815-line requirements document. Read under the instruction to flag gaps
+without re-opening settled decisions.
+
+### The three-tier ladder is vindicated
+
+SRS §5.4 / FR-CNF-001 specifies **Tier 1 as a recipient tap**, transitioning to `DELIVERED`
+and `CONFIRMED` in one transaction with `confirmation_method = recipient_tap`. The audited
+build's "v1.2" withdrawal of that tier departs from SRS v1.0, the concept note **and** the
+brief simultaneously. Restoring three tiers, as decided on 19 August, returns the code to what
+every governing document already required.
+
+### Requirements absent from both the build and the design specification
+
+| Requirement | Substance |
+|---|---|
+| **FR-CNF-009** | The rider may descend the ladder but never skip **upward** — a rider must not be able to self-confirm on the recipient's behalf at Tier 1. Without this, restoring Tier 1 hands riders a way to fake the strongest proof. |
+| **FR-CNF-010** | Where GPS accuracy exceeds the geofence radius, offer an override recording accuracy and reason, requiring Tier 1 or Tier 2 confirmation, flagged for management review — never granted silently. |
+| **FR-CNF-006** | Tier 3 artefact upload is asynchronous and retried; a slow or failed upload must never block the `DELIVERED` transition. |
+| **FR-CNF-008** | The tier used is recorded and surfaced. A Tier 3 close is weaker proof than Tier 1, and the record must show that rather than flatten it. |
+| **FR-STM-013** | Every replayed event carries `was_offline = true` **and both clocks**, so the offline period is visible in the proof record. Partially present. |
+
+### A correction the design specification needs
+
+**FR-STM-014** requires that a batch whose device time runs backwards, or exceeds server time
+beyond tolerance, is **accepted if otherwise legal and flagged `anomaly: clock_skew`** — on the
+stated grounds that "device clocks are wrong often; that is a data-quality signal, not grounds
+to discard a rider's work."
+
+The approved design specification says such violations *reject the chain*. **The SRS is right
+and the spec is wrong**, and it is the same accept-and-flag principle the audited build already
+applies to mock-provider and accuracy anomalies. Neither the build nor the spec currently
+implements the `clock_skew` flag at all.
+
+### Strengthens H2
+
+FR-STM-012 requires a conflicting batch to return `409 CHAIN_CONFLICT` **with the conflicting
+server state**, and the rider to be shown "a plain-language explanation of what changed rather
+than an error code." The current handler flattens `sqlerrm` into text and returns neither the
+server state nor the failing index. H2 is therefore a requirement violation, not merely a
+usability gap.
 
 ---
 
