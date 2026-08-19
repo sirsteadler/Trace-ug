@@ -12,8 +12,9 @@ create type actor_type          as enum ('rider','admin','recipient','system');
 create type delivery_health     as enum ('green','amber','red');
 create type user_role           as enum ('rider','sub_admin','super_admin','sender');
 create type sync_state          as enum ('pending','in_flight','succeeded','parked');
--- v1.2: recipient_tap withdrawn; the tracking page is view-only.
-create type confirmation_method as enum ('pin_entry','signature','photograph');
+-- SRS v1.0 FR-CNF-001: recipient_tap is Tier 1 and the primary path. The v1.2
+-- withdrawal departed from the SRS, the concept note and the brief at once.
+create type confirmation_method as enum ('recipient_tap','pin_entry','signature','photograph');
 
 create table organisations (
   id          uuid primary key default gen_random_uuid(),
@@ -66,7 +67,8 @@ create table deliveries (
   eta_at              timestamptz,
   promised_at         timestamptz,
   health              delivery_health not null default 'green',
-  confirmation_tier   smallint check (confirmation_tier in (1,2)),
+  -- FR-CNF-008: the tier is recorded so a weaker proof stays visible as one.
+  confirmation_tier   smallint check (confirmation_tier in (1,2,3)),
   created_at          timestamptz not null default now(),
   completed_at        timestamptz
 );

@@ -186,3 +186,55 @@ create policy sap_queue_admin_read on sap_sync_queue
 -- organisations ----------------------------------------------------------------
 create policy org_member_read on organisations
   for select using (id = current_org_id());
+
+-- Shift end erases the live position. -------------------------------------------
+-- The concept note states "Go Off Shift = GPS stops, live position record
+-- deleted" and §09 presents that as structural rather than procedural. Setting
+-- ended_at does not cascade — the shift row still exists — so without this the
+-- last known position of an off-duty rider stays readable by admins.
+create or replace function erase_position_on_shift_end()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.ended_at is not null and old.ended_at is null then
+    delete from rider_positions where rider_id = new.rider_id;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger shifts_erase_position
+  after update on shifts
+  for each row execute function erase_position_on_shift_end();
+
+-- Moving the geofence is an auditable act. --------------------------------------
+-- deliveries_admin_assign cannot restrict columns, so an admin could widen
+-- geofence_radius_m to 5 km, let a rider close from anywhere, and restore it
+-- leaving no trace: only status changes are audited. This records the change.
+create or replace function audit_geofence_change()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.destination_lat   is distinct from old.destination_lat
+  or new.destination_lng   is distinct from old.destination_lng
+  or new.geofence_radius_m is distinct from old.geofence_radius_m then
+    insert into delivery_events (
+      delivery_id, from_status, to_status, actor_type, actor_id, meta
+    ) values (
+      new.id, old.status, old.status,
+      case when current_role_name() = 'rider' then 'rider' else 'admin' end::actor_type,
+      auth.uid(),
+      jsonb_build_object(
+        'kind', 'geofence_amended',
+        'from', jsonb_build_object('lat', old.destination_lat, 'lng', old.destination_lng,
+                                   'radius_m', old.geofence_radius_m),
+        'to',   jsonb_build_object('lat', new.destination_lat, 'lng', new.destination_lng,
+                                   'radius_m', new.geofence_radius_m)
+      )
+    );
+  end if;
+  return new;
+end;
+$$;
+
+create trigger deliveries_geofence_audit
+  after update on deliveries
+  for each row execute function audit_geofence_change();

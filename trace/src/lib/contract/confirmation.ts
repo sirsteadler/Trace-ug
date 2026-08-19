@@ -1,11 +1,16 @@
 /**
- * Confirmation ladder rules. SRS v1.2 §5.4.
+ * Confirmation ladder rules. SRS v1.0 §5.4.
  *
- * Tier 1  pin_entry            primary — OTP SMSed to the recipient on ARRIVED
- * Tier 2  signature|photograph fallback — phone unreachable / code never came
+ * Tier 1  recipient_tap        the recipient taps Received — their own act
+ * Tier 2  pin_entry            OTP SMSed to the recipient on ARRIVED
+ * Tier 3  signature|photograph phone unreachable / code never came
  *
  * Every tier is geofence-validated server side (FR-CNF-007). Nothing here
  * grants a completion; this module decides what the rider is *offered*.
+ *
+ * Tier 1 never appears in the rider's interface: it is the recipient's action,
+ * taken on their own device, and FR-CNF-009 forbids a rider claiming it. From
+ * the rider's side the ladder therefore starts at Tier 2.
  */
 import { CONFIRMATION_TIER, type ConfirmationMethod } from './status';
 
@@ -24,9 +29,9 @@ export function isWellFormedPin(input: string): boolean {
 }
 
 /**
- * FR-CNF-009, restated for two tiers: the rider may descend the ladder but
- * never ascend it. Descending is a deliberate act with a recorded reason —
- * it produces a weaker proof and the record must show that.
+ * FR-CNF-009: the rider may descend the ladder but never ascend it. Descending
+ * is a deliberate act with a recorded reason — it produces a weaker proof and
+ * the record must show that.
  */
 export const FALLBACK_REASONS = [
   'phone_unreachable',
@@ -44,7 +49,8 @@ export const FALLBACK_REASON_LABELS: Record<FallbackReason, string> = {
 };
 
 export interface LadderState {
-  readonly tier: 1 | 2;
+  /** The rung the rider is currently on. Tier 1 is the recipient's, never theirs. */
+  readonly tier: 2 | 3;
   readonly attemptsUsed: number;
   readonly lockedUntil: number | null;
   readonly pinExpiresAt: number | null;
@@ -77,7 +83,7 @@ export function resendCooldownRemaining(state: LadderState, now = Date.now()): n
 /** Whether the rider may submit a PIN at all right now. */
 export function canSubmitPin(state: LadderState, now = Date.now()): boolean {
   return (
-    state.tier === 1 &&
+    state.tier === 2 &&
     !isLockedOut(state, now) &&
     !isPinExpired(state, now) &&
     attemptsLeft(state) > 0
@@ -85,13 +91,13 @@ export function canSubmitPin(state: LadderState, now = Date.now()): boolean {
 }
 
 /**
- * The rider may drop to Tier 2 at any point — a rider standing at a door with
+ * The rider may drop to Tier 3 at any point — a rider standing at a door with
  * an unreachable recipient must never be trapped by a code that will not come.
  */
 export function canDescend(state: LadderState): boolean {
-  return state.tier === 1;
+  return state.tier === 2;
 }
 
-export function tierOf(method: ConfirmationMethod): 1 | 2 {
+export function tierOf(method: ConfirmationMethod): 1 | 2 | 3 {
   return CONFIRMATION_TIER[method];
 }

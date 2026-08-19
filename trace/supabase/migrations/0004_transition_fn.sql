@@ -33,7 +33,9 @@ values
   ('T-08','PICKED_UP','IN_TRANSIT','{rider,system}',   true, false,false,false),
   ('T-09','IN_TRANSIT','ARRIVED', '{rider}',           true, false,false,false),
   ('T-10','ARRIVED','DELIVERED',  '{rider}',           true, true, true, false),
-  ('T-11','DELIVERED','CONFIRMED','{system}',          false,false,false,false),
+  -- FR-CNF-005: a Tier 3 close lands on DELIVERED, and the recipient's later
+  -- reply to the asynchronous SMS is what carries it to CONFIRMED.
+  ('T-11','DELIVERED','CONFIRMED','{recipient,system}',false,false,false,false),
   ('T-12','ASSIGNED','FAILED',    '{rider,admin}',     false,false,false,true ),
   ('T-12','ACCEPTED','FAILED',    '{rider,admin}',     false,false,false,true ),
   ('T-12','AT_PICKUP','FAILED',   '{rider,admin}',     false,false,false,true ),
@@ -92,21 +94,68 @@ declare
   v_speed_kmh     numeric;
   v_final_status  delivery_status;
   v_tier          smallint;
+  v_org           uuid;
+  v_track_claim   uuid;
+  v_device_time   timestamptz;
+  v_prev_device_time timestamptz;
 begin
   v_key := payload->>'idempotency_key';
   v_to  := (payload->>'to_status')::delivery_status;
 
   -- GUARD 1: actor authorisation. First, so an unauthorised caller learns
   -- nothing about delivery state (FR-STM-008).
-  select role into v_role from profiles where id = auth.uid() and is_active;
-  if v_role is null then
+  --
+  -- Two identity sources. Staff and riders arrive as Supabase users. Recipients
+  -- have no account at all and arrive holding a scoped tracking JWT whose
+  -- tracking_delivery_id claim names the one delivery they may act on.
+  v_track_claim := nullif(
+    current_setting('request.jwt.claims', true)::jsonb ->> 'tracking_delivery_id', ''
+  )::uuid;
+
+  if auth.uid() is not null then
+    select role, org_id into v_role, v_org
+      from profiles where id = auth.uid() and is_active;
+    if v_role is null then
+      perform raise_trace_error('UNAUTHENTICATED');
+    end if;
+
+    -- Mapped explicitly. `case when rider then rider else admin` collapses every
+    -- other role — including `sender`, which exists in user_role — into full
+    -- admin transition rights over every delivery in the database.
+    v_actor := case v_role
+                 when 'rider'       then 'rider'::actor_type
+                 when 'sub_admin'   then 'admin'::actor_type
+                 when 'super_admin' then 'admin'::actor_type
+                 else null
+               end;
+    if v_actor is null then
+      perform raise_trace_error('FORBIDDEN_ACTOR');
+    end if;
+  elsif v_track_claim is not null then
+    v_actor := 'recipient'::actor_type;
+  else
     perform raise_trace_error('UNAUTHENTICATED');
   end if;
-  v_actor := case when v_role = 'rider' then 'rider'::actor_type else 'admin'::actor_type end;
 
-  select * into v_delivery from deliveries where id = (payload->>'delivery_id')::uuid;
+  -- FOR UPDATE. Without the lock two concurrent calls both read ARRIVED, both
+  -- pass legality and both write. The idempotency index stops a duplicate of the
+  -- SAME action; it does nothing about two different ones racing.
+  select * into v_delivery from deliveries
+    where id = (payload->>'delivery_id')::uuid
+    for update;
   if not found then
     perform raise_trace_error('FORBIDDEN_ACTOR');
+  end if;
+
+  if v_actor = 'recipient' then
+    -- The claim, not the payload, decides which delivery a recipient may touch.
+    if v_delivery.id is distinct from v_track_claim then
+      perform raise_trace_error('FORBIDDEN_ACTOR');
+    end if;
+  else
+    if v_delivery.org_id is distinct from v_org then
+      perform raise_trace_error('FORBIDDEN_ACTOR');
+    end if;
   end if;
 
   if v_actor = 'rider' and v_delivery.assigned_rider_id is distinct from auth.uid() then
@@ -174,18 +223,36 @@ begin
     end if;
   end if;
 
-  -- GUARD 5: confirmation. v1.2 two-tier ladder.
+  -- GUARD 5: confirmation. SRS §5.4, the three-tier ladder.
+  --
+  --   Tier 1  recipient_tap        the recipient's own affirmation
+  --   Tier 2  pin_entry            a code only the recipient received
+  --   Tier 3  signature/photograph the rider's account of the handover
+  --
+  -- FR-CNF-009: the ladder may be descended but never climbed. Tier 1 is the
+  -- recipient asserting receipt, so only a recipient may claim it — otherwise a
+  -- rider could manufacture the strongest proof in the system unaided.
   if v_rule.requires_confirmation then
     v_method := payload#>>'{confirmation,method}';
     if v_method is null then
       perform raise_trace_error('CONFIRMATION_REQUIRED');
     end if;
-    if v_method = 'pin_entry' then
-      perform verify_confirmation_pin(v_delivery.id, payload#>>'{confirmation,pin}');
-      v_tier := 1;
-    else
-      v_tier := 2;
-    end if;
+
+    case v_method
+      when 'recipient_tap' then
+        if v_actor <> 'recipient' then
+          perform raise_trace_error('FORBIDDEN_ACTOR',
+            '{"reason":"tier 1 is the recipient''s own act (FR-CNF-009)"}'::jsonb);
+        end if;
+        v_tier := 1;
+      when 'pin_entry' then
+        perform verify_confirmation_pin(v_delivery.id, payload#>>'{confirmation,pin}');
+        v_tier := 2;
+      when 'signature', 'photograph' then
+        v_tier := 3;
+      else
+        perform raise_trace_error('INVALID_PAYLOAD', '{"field":"confirmation.method"}'::jsonb);
+    end case;
   end if;
 
   -- Anomaly annotation. Accept-and-flag: a false rejection strands a rider.
@@ -194,6 +261,22 @@ begin
   end if;
   if v_accuracy is not null and v_accuracy > 200 then
     v_anomalies := v_anomalies || 'unreliable_position';
+  end if;
+
+  -- FR-STM-014: a device clock ahead of the server, or running backwards within
+  -- a chain, is flagged and accepted. Device clocks are wrong often; that is a
+  -- data-quality signal, not grounds to discard a rider's work.
+  v_device_time := nullif(payload->>'device_time','')::timestamptz;
+  if v_device_time is not null then
+    if v_device_time > now() + interval '2 minutes' then
+      v_anomalies := v_anomalies || 'clock_skew';
+    else
+      select max(device_time) into v_prev_device_time
+        from delivery_events where delivery_id = v_delivery.id;
+      if v_prev_device_time is not null and v_device_time < v_prev_device_time then
+        v_anomalies := v_anomalies || 'clock_skew';
+      end if;
+    end if;
   end if;
 
   select lat, lng, server_time into v_prev from delivery_events
@@ -210,20 +293,24 @@ begin
     end if;
   end if;
 
-  -- FR-STM-007: a flagged position cannot be closed on Tier 2 alone.
+  -- FR-STM-007 / FR-CNF-010: where the position cannot be trusted, the proof of
+  -- WHO must carry the weight the proof of WHERE cannot. Tier 3 is the rider's
+  -- own account, so it is exactly the tier that must not be available here.
   if v_rule.requires_geofence
      and 'unreliable_position' = any(v_anomalies)
-     and v_tier = 2 then
+     and v_tier = 3 then
     perform raise_trace_error('CONFIRMATION_REQUIRED',
-      '{"reason":"unreliable_position requires tier 1"}'::jsonb);
+      '{"reason":"unreliable_position requires tier 1 or tier 2"}'::jsonb);
   end if;
 
   -- Commit. FR-STM-005: one atomic transaction, or nothing.
   v_final_status := v_to;
-  -- v1.2: a Tier 1 close carries the recipient's own affirmation, so it runs
-  -- straight through to CONFIRMED. A Tier 2 close stops at DELIVERED and is
-  -- surfaced to dispatch as "delivered, unconfirmed" rather than upgraded.
-  if v_to = 'DELIVERED' and v_tier = 1 then
+  -- Tiers 1 and 2 both carry the recipient's own affirmation — a tap they made,
+  -- or a code only they received — so either runs straight through to CONFIRMED
+  -- (FR-CNF-001). Tier 3 is the rider's account of the handover: it stops at
+  -- DELIVERED and waits for the asynchronous SMS reply (FR-CNF-005). Dispatch
+  -- sees those as "delivered, unconfirmed" rather than having them upgraded.
+  if v_to = 'DELIVERED' and v_tier in (1, 2) then
     v_final_status := 'CONFIRMED';
   end if;
 
@@ -285,21 +372,45 @@ as $$
 declare
   v_action    jsonb;
   v_committed text[] := '{}';
+  v_index     int := 0;
+  v_failed    jsonb;
+  v_state     delivery_status;
 begin
   -- plpgsql exceptions roll the whole function back, so validating as we go IS
   -- validating the chain before committing any of it: a failure at index 3
   -- discards the commits from 0..2. FR-STM-011.
   for v_action in select * from jsonb_array_elements(actions)
   loop
+    v_failed := v_action;
     perform delivery_transition(v_action || jsonb_build_object('was_offline', true));
     v_committed := v_committed || (v_action->>'idempotency_key');
+    v_index := v_index + 1;
   end loop;
   return to_jsonb(v_committed);
 exception
   when others then
+    -- FR-STM-012: return the conflicting server state and enough structure for
+    -- the rider to be told, in plain language, which action failed and what
+    -- changed underneath them. Flattening this to a message string leaves the
+    -- client with nothing to explain and nothing to resolve.
+    --
+    -- The failed subtransaction is rolled back by the time we get here, so this
+    -- read sees committed state rather than anything the loop attempted.
+    select status into v_state from deliveries
+      where id = (v_failed->>'delivery_id')::uuid;
+
     raise exception 'CHAIN_CONFLICT'
       using errcode = 'raise_exception',
-            detail = jsonb_build_object('batch_id', batch_id, 'cause', sqlerrm)::text;
+            detail = jsonb_build_object(
+              'batch_id',        batch_id,
+              'failed_index',    v_index,
+              'failed_key',      v_failed->>'idempotency_key',
+              'delivery_id',     v_failed->>'delivery_id',
+              'requested',       v_failed->>'to_status',
+              'server_status',   v_state,
+              'code',            sqlerrm,
+              'committed_count', array_length(v_committed, 1)
+            )::text;
 end;
 $$;
 

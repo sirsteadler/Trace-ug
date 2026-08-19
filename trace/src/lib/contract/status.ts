@@ -33,34 +33,57 @@ export const ACTOR_TYPES = ['rider', 'admin', 'recipient', 'system'] as const;
 export type ActorType = (typeof ACTOR_TYPES)[number];
 
 /**
- * SRS v1.2 §5.4. The ladder is TWO tiers, not three:
+ * SRS v1.0 §5.4. The ladder is THREE tiers:
  *
- *   Tier 1 (primary)  pin_entry  — server SMSes an OTP on ARRIVED; the
- *                                  recipient reads it aloud; the rider enters it.
- *   Tier 2 (fallback) signature | photograph — used when the recipient's phone
- *                                  is unreachable or the code never arrives.
+ *   Tier 1  recipient_tap        — the recipient taps Received in the tracking
+ *                                  link or installed app. FR-CNF-001.
+ *   Tier 2  pin_entry            — server SMSes an OTP on ARRIVED; the recipient
+ *                                  reads it aloud; the rider enters it.
+ *   Tier 3  signature|photograph — the rider's account of the handover, used
+ *                                  when the recipient is absent or unreachable.
  *
- * `recipient_tap` was withdrawn when the tracking page became view-only.
- * The identifier is not reused. SRS "How to read this document".
+ * The two-tier reading withdrew `recipient_tap`, which is the tier the brief
+ * asks for by name and the one §16 of the concept note demonstrates. Restored.
  */
-export const CONFIRMATION_METHODS = ['pin_entry', 'signature', 'photograph'] as const;
+export const CONFIRMATION_METHODS = [
+  'recipient_tap',
+  'pin_entry',
+  'signature',
+  'photograph',
+] as const;
 export type ConfirmationMethod = (typeof CONFIRMATION_METHODS)[number];
 
 /** Which rung a method belongs to. Recorded on the delivery — FR-CNF-008. */
-export const CONFIRMATION_TIER: Record<ConfirmationMethod, 1 | 2> = {
-  pin_entry: 1,
-  signature: 2,
-  photograph: 2,
+export const CONFIRMATION_TIER: Record<ConfirmationMethod, 1 | 2 | 3> = {
+  recipient_tap: 1,
+  pin_entry: 2,
+  signature: 3,
+  photograph: 3,
 };
 
 /**
- * Only a Tier 1 confirmation carries the recipient's own affirmation, so only
- * Tier 1 may take a delivery through to CONFIRMED in the same transaction.
- * A Tier 2 close ends at DELIVERED and is surfaced to dispatch as
- * "delivered, unconfirmed" rather than silently upgraded by the system.
+ * Tiers 1 and 2 both carry the recipient's own affirmation — a tap they made, or
+ * a code only they received — so either takes the delivery through to CONFIRMED
+ * in the same transaction (FR-CNF-001).
+ *
+ * Tier 3 is the rider's account of the handover. It ends at DELIVERED and waits
+ * for the asynchronous SMS reply (FR-CNF-005); dispatch sees it as "delivered,
+ * unconfirmed" rather than having it silently upgraded by the system.
  */
 export function reachesConfirmed(method: ConfirmationMethod): boolean {
-  return CONFIRMATION_TIER[method] === 1;
+  return CONFIRMATION_TIER[method] <= 2;
+}
+
+/**
+ * FR-CNF-009. Tier 1 is the recipient asserting receipt, so only a recipient may
+ * claim it: a rider who could select it would be manufacturing the strongest
+ * proof in the system unaided. Enforced server-side in delivery_transition().
+ */
+export function methodAllowedForActor(
+  method: ConfirmationMethod,
+  actor: ActorType,
+): boolean {
+  return method === 'recipient_tap' ? actor === 'recipient' : actor === 'rider';
 }
 
 export const DELIVERY_HEALTH = ['green', 'amber', 'red'] as const;
@@ -108,7 +131,7 @@ export const TRANSITIONS: readonly Transition[] = [
   { id: 'T-08', from: 'PICKED_UP',  to: 'IN_TRANSIT', actors: ['rider', 'system'],     requiresPosition: true,  requiresGeofence: false, requiresConfirmation: false, requiresReason: false },
   { id: 'T-09', from: 'IN_TRANSIT', to: 'ARRIVED',    actors: ['rider'],               requiresPosition: true,  requiresGeofence: false, requiresConfirmation: false, requiresReason: false },
   { id: 'T-10', from: 'ARRIVED',    to: 'DELIVERED',  actors: ['rider'],               requiresPosition: true,  requiresGeofence: true,  requiresConfirmation: true,  requiresReason: false },
-  { id: 'T-11', from: 'DELIVERED',  to: 'CONFIRMED',  actors: ['system'],              requiresPosition: false, requiresGeofence: false, requiresConfirmation: false, requiresReason: false },
+  { id: 'T-11', from: 'DELIVERED',  to: 'CONFIRMED',  actors: ['recipient', 'system'], requiresPosition: false, requiresGeofence: false, requiresConfirmation: false, requiresReason: false },
 
   // T-12: FAILED is reachable from ASSIGNED through ARRIVED.
   ...(['ASSIGNED', 'ACCEPTED', 'AT_PICKUP', 'PICKED_UP', 'IN_TRANSIT', 'ARRIVED'] as const).map(

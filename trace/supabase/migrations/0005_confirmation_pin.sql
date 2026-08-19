@@ -15,6 +15,7 @@ set search_path = public, extensions
 as $$
 declare
   v_pin      text;
+  v_n        int;
   v_existing confirmation_pins%rowtype;
 begin
   select * into v_existing from confirmation_pins where delivery_id = p_delivery;
@@ -25,9 +26,21 @@ begin
     return;
   end if;
 
-  -- 6 digits, from a CSPRNG. Left-padded so every code is the same length —
-  -- a rider reading "04821" back as "4821" is a support call we can design out.
-  v_pin := lpad((floor(random() * 1000000))::int::text, 6, '0');
+  -- 6 digits from a CSPRNG. random() is a seeded PRNG and is documented as not
+  -- cryptographically secure, so gen_random_bytes() is used instead; pgcrypto is
+  -- already a dependency for crypt() below, so this costs nothing.
+  --
+  -- Rejection sampling rather than a plain modulo: 2^24 is not a multiple of
+  -- 10^6, so `% 1000000` alone would make the low codes fractionally likelier.
+  -- 16,000,000 is the largest multiple of 10^6 below 2^24.
+  --
+  -- Left-padded so every code is the same length — a rider reading "04821" back
+  -- as "4821" is a support call we can design out.
+  loop
+    v_n := ('x' || encode(gen_random_bytes(3), 'hex'))::bit(24)::int;
+    exit when v_n < 16000000;
+  end loop;
+  v_pin := lpad((v_n % 1000000)::text, 6, '0');
 
   insert into confirmation_pins (delivery_id, pin_hash, expires_at, last_sent_at)
   values (
@@ -45,8 +58,12 @@ begin
     consumed_at   = null;
 
   -- Hand the plaintext to the SMS worker and to nothing else. The row in
-  -- outbound_sms is the ONLY place it exists, it is deleted on send, and it is
-  -- never returned to any client. NFR-SEC-004, NFR-PRV-005.
+  -- outbound_sms is the ONLY place it exists and it is never returned to any
+  -- client. NFR-SEC-004, NFR-PRV-005.
+  --
+  -- The worker MUST null `body` on successful send. purge_outbound_sms() below
+  -- is the backstop for anything the worker misses; without one of the two, every
+  -- code ever issued accumulates in plaintext beside a recipient phone number.
   insert into outbound_sms (delivery_id, to_phone, body, purpose)
   select
     p_delivery,
@@ -72,6 +89,19 @@ create table if not exists outbound_sms (
 alter table outbound_sms enable row level security;
 -- No client policy. Only the SMS Edge Function, holding the service role,
 -- ever reads this table. The PIN plaintext lives here and nowhere else.
+
+-- Backstop for the plaintext. A code is valid for 15 minutes; anything older
+-- than an hour has no reason to still carry its body, sent or not. Scheduled
+-- hourly via pg_cron in 0006.
+create or replace function purge_outbound_sms()
+returns void language sql security definer set search_path = public as $$
+  update outbound_sms
+     set body = '[purged]'
+   where body <> '[purged]'
+     and created_at < now() - interval '1 hour';
+$$;
+
+revoke all on function purge_outbound_sms() from public, anon, authenticated;
 
 -- Verify. Called by delivery_transition() on a pin_entry confirmation. ---------
 create or replace function verify_confirmation_pin(p_delivery uuid, p_pin text)
