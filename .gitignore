@@ -54,3 +54,6 @@ desktop.ini
 
 # claude local session state
 .claude/settings.local.json
+
+# staging area for files pending deletion
+_to_delete/

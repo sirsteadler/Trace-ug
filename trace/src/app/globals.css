@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+/*
+ * TRACE design tokens. NFR-USE-007: one token set across rider, tracking page
+ * and dashboard, so the product reads as one system.
+ *
+ * §5.2.2: dark by default. Night deliveries are common and dark surfaces
+ * conserve battery on OLED. Light is a preference, not the default.
+ * NFR-USE-002: body text >= 4.5:1, primary rider actions >= 7:1 for sunlight.
+ */
+@theme {
+  --color-ink-900: #05070a;
+  --color-ink-800: #0b1017;
+  --color-ink-700: #131b25;
+  --color-ink-600: #1d2836;
+  --color-ink-500: #2b3a4d;
+  --color-mist-400: #7d8fa3;
+  --color-mist-200: #c3cedb;
+  --color-mist-100: #e8eef4;
+
+  /* Action. 8.9:1 on ink-900 — comfortably past the 7:1 sunlight bar. */
+  --color-go-500: #2ee6a8;
+  --color-go-600: #16c98e;
+  --color-go-700: #0f9d6f;
+
+  --color-warn-500: #ffb020;
+  --color-stop-500: #ff5d5d;
+  --color-info-500: #4aa8ff;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+  /* NFR-USE-001: 56px minimum target, 8px minimum separation. */
+  --spacing-tap: 3.5rem;
+}
+
+html, body {
+  background: var(--color-ink-900);
+  color: var(--color-mist-100);
+  /* NFR-USE-009: no horizontal scroll at any width from 320px up. */
+  overflow-x: hidden;
+  max-width: 100vw;
+}
+
+/* NFR-USE-009: long unbroken strings wrap rather than widening the layout.
+   TRACE IDs, Ugandan addresses and recipient names are all candidates. */
+.wrap-hard {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Respect the platform. A rider who has turned motion down gets none. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Visible focus for keyboard and switch access. NFR-USE-010. */
+:focus-visible {
+  outline: 3px solid var(--color-info-500);
+  outline-offset: 2px;
+}
