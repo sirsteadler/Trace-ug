@@ -1,0 +1,56 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# next.js
+.next/
+out/
+build/
+next-env.d.ts
+
+# production
+dist/
+
+# environment — never commit credentials
+.env
+.env.local
+.env*.local
+.env.production
+
+# supabase
+.branches
+.temp
+supabase/.temp/
+
+# vercel
+.vercel
+
+# testing
+coverage/
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# typescript
+*.tsbuildinfo
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# os
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# editor
+.idea/
+*.swp
+*.swo
+
+# claude local session state
+.claude/settings.local.json
