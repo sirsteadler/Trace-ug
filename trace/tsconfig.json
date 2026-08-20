@@ -35,5 +35,11 @@
     ".next/dev/types/**/*.ts",
     "**/*.mts"
   ],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules",
+    // Edge Functions are Deno, not Node: they use Deno globals and npm:
+    // specifiers that this compiler cannot resolve, and type-checking them here
+    // fails the Next build. They are checked by `deno check` instead.
+    "supabase/functions"
+  ]
 }
