@@ -12,7 +12,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 
-select plan(15);
+select plan(21);
 
 -- Fixtures ---------------------------------------------------------------------
 insert into auth.users (id, email) values
@@ -263,6 +263,70 @@ select is(
       and meta->>'kind' = 'geofence_amended'),
   0,
   'no geofence amendment recorded before one is made'
+);
+
+-- 16. A rider cannot create a delivery ----------------------------------------
+-- Creation decides the trace_id, the organisation and the geofence radius.
+-- None of those may come from a caller who could simply choose them.
+select act_as('a0000000-0000-4000-8000-000000000001');
+
+select throws_ok(
+  $$ select create_delivery(jsonb_build_object(
+       'recipient_name',      'Fraud Target',
+       'recipient_phone',     '+256700000009',
+       'destination_address', 'Anywhere'
+     )) $$,
+  'FORBIDDEN_ACTOR',
+  'a rider cannot create a delivery'
+);
+
+-- 17. An admin can, and the audit log starts at creation ----------------------
+select act_as('a0000000-0000-4000-8000-000000000003');
+
+select lives_ok(
+  $$ select create_delivery(jsonb_build_object(
+       'recipient_name',      'Created Recipient',
+       'recipient_phone',     '+256700000010',
+       'destination_address', 'Ntinda',
+       'destination_lat',     0.3535,
+       'destination_lng',     32.6129
+     )) $$,
+  'an admin can create a delivery'
+);
+
+select is(
+  (select count(*)::int from delivery_events e
+     join deliveries d on d.id = e.delivery_id
+    where d.recipient_name = 'Created Recipient'
+      and e.to_status = 'CREATED'
+      and e.meta->>'rule' = 'T-01'),
+  1,
+  'creation writes its own audit row: who entered it is part of the record'
+);
+
+-- 18. Assignment is one act, recorded ------------------------------------------
+select lives_ok(
+  $$ select assign_delivery(
+       (select id from deliveries where recipient_name = 'Created Recipient'),
+       'a0000000-0000-4000-8000-000000000001'
+     ) $$,
+  'an admin can assign a delivery to a rider'
+);
+
+select is(
+  (select status::text from deliveries where recipient_name = 'Created Recipient'),
+  'ASSIGNED',
+  'and the delivery moves to ASSIGNED through the state machine'
+);
+
+-- 19. A delivery cannot be assigned to someone who is not a rider -------------
+select throws_ok(
+  $$ select assign_delivery(
+       (select id from deliveries where recipient_name = 'Created Recipient'),
+       'a0000000-0000-4000-8000-000000000004'
+     ) $$,
+  'INVALID_PAYLOAD',
+  'a sender cannot be assigned deliveries'
 );
 
 select * from finish();
