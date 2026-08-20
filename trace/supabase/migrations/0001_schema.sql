@@ -19,6 +19,10 @@ create type confirmation_method as enum ('recipient_tap','pin_entry','signature'
 create table organisations (
   id          uuid primary key default gen_random_uuid(),
   name        text not null,
+  -- Per-organisation operational thresholds, read by deliveries_with_health in
+  -- 0007: health_amber_minutes, health_red_minutes. Kept as jsonb rather than
+  -- columns because these are tuning knobs a dispatcher changes, not schema.
+  settings    jsonb not null default '{}'::jsonb,
   created_at  timestamptz not null default now()
 );
 
