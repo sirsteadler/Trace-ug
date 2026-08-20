@@ -360,6 +360,12 @@ begin
     assigned_rider_id = case when v_final_status = 'CREATED' then null else assigned_rider_id end
   where id = v_delivery.id;
 
+  -- Disarm immediately. set_config(..., true) lasts the whole transaction, so
+  -- leaving it set means every later statement in the same transaction can write
+  -- status directly — the guard would protect only callers who had not already
+  -- made one legitimate transition. The window is one statement wide by design.
+  perform set_config('trace.transition_ok', '0', true);
+
   -- Side effect declared in SERVER_SIDE_EFFECTS: arriving dispatches the OTP.
   if v_final_status = 'ARRIVED' then
     perform issue_confirmation_pin(v_delivery.id);

@@ -1,4 +1,4 @@
--- TRACE — full schema, migrations 0001-0006 concatenated in order.
+-- TRACE — full schema, migrations 0001-0008 concatenated in order.
 -- Generated for the Supabase SQL editor. Run once, top to bottom, on a fresh
 -- project. The canonical files are in supabase/migrations/ — edit those, not
 -- this one, and regenerate.
@@ -27,6 +27,10 @@ create type confirmation_method as enum ('recipient_tap','pin_entry','signature'
 create table organisations (
   id          uuid primary key default gen_random_uuid(),
   name        text not null,
+  -- Per-organisation operational thresholds, read by deliveries_with_health in
+  -- 0007: health_amber_minutes, health_red_minutes. Kept as jsonb rather than
+  -- columns because these are tuning knobs a dispatcher changes, not schema.
+  settings    jsonb not null default '{}'::jsonb,
   created_at  timestamptz not null default now()
 );
 
@@ -833,6 +837,12 @@ begin
     assigned_rider_id = case when v_final_status = 'CREATED' then null else assigned_rider_id end
   where id = v_delivery.id;
 
+  -- Disarm immediately. set_config(..., true) lasts the whole transaction, so
+  -- leaving it set means every later statement in the same transaction can write
+  -- status directly — the guard would protect only callers who had not already
+  -- made one legitimate transition. The window is one statement wide by design.
+  perform set_config('trace.transition_ok', '0', true);
+
   -- Side effect declared in SERVER_SIDE_EFFECTS: arriving dispatches the OTP.
   if v_final_status = 'ARRIVED' then
     perform issue_confirmation_pin(v_delivery.id);
@@ -1359,4 +1369,137 @@ select cron.schedule(
   'purge-tracking-sessions', '23 3 * * *',
   $cron$ select purge_tracking_sessions(); $cron$
 );
+
+-- ============================================================
+-- migrations/0007_delivery_health.sql
+-- ============================================================
+-- TRACE — delivery health. SRS §5.1, concept note §5.4.
+--
+-- deliveries.health is a stored column that nothing ever writes, so every
+-- delivery has read 'green' since the schema was created. The wallboard exists
+-- to say where attention is required; against a column fixed at green it says
+-- nothing at all.
+--
+-- Computed in a view rather than maintained by a job, so the dashboard, the
+-- wallboard and any later report cannot disagree. There is one definition of
+-- late and it lives here. Recomputing on read costs nothing at pilot volume and
+-- removes a whole class of staleness bug.
+--
+-- Thresholds are per-organisation, read from organisations.settings, defaulting
+-- to the rule agreed on 19 August: amber past 5 minutes, red past 15.
+
+create or replace view deliveries_with_health as
+select
+  d.*,
+  case
+    -- Terminal states are not late; they are finished.
+    when d.status in ('CONFIRMED','FAILED','RETURNED') then 'green'::delivery_health
+    when d.eta_at is null                              then 'green'::delivery_health
+    when now() > d.eta_at + make_interval(mins => coalesce(
+           (o.settings->>'health_red_minutes')::int, 15))
+      then 'red'::delivery_health
+    when now() > d.eta_at + make_interval(mins => coalesce(
+           (o.settings->>'health_amber_minutes')::int, 5))
+      then 'amber'::delivery_health
+    else 'green'::delivery_health
+  end as computed_health,
+  -- Signed, so the dashboard can say "12 minutes early" as readily as late.
+  case when d.eta_at is null then null
+       else round(extract(epoch from (now() - d.eta_at)) / 60)::int
+  end as minutes_late
+from deliveries d
+join organisations o on o.id = d.org_id;
+
+-- security_invoker: the view runs with the caller's rights, so the RLS policies
+-- on deliveries apply through it. Without this a view owned by postgres would
+-- hand every reader every row — the classic way an RLS matrix is silently
+-- bypassed by the convenience layer built on top of it.
+alter view deliveries_with_health set (security_invoker = on);
+
+grant select on deliveries_with_health to authenticated;
+
+-- Wallboard counters. -----------------------------------------------------------
+-- One round trip for the numbers a dispatcher reads from three metres, rather
+-- than fetching every row to count it in the browser.
+create or replace function delivery_health_summary()
+returns jsonb
+language sql
+stable
+security invoker
+set search_path = public
+as $$
+  select jsonb_build_object(
+    'active',    count(*) filter (where status not in ('CONFIRMED','FAILED','RETURNED')),
+    'amber',     count(*) filter (where computed_health = 'amber'),
+    'red',       count(*) filter (where computed_health = 'red'),
+    'completed_today', count(*) filter (
+      where status = 'CONFIRMED' and completed_at >= date_trunc('day', now())
+    )
+  )
+  from deliveries_with_health;
+$$;
+
+grant execute on function delivery_health_summary() to authenticated;
+
+-- ============================================================
+-- migrations/0008_grants.sql
+-- ============================================================
+-- TRACE — table privileges. SRS §3.5.
+--
+-- RLS and GRANT answer different questions. A policy decides WHICH ROWS a role
+-- may see; a grant decides whether it may address the table at all. Without
+-- both, every query returns "permission denied" no matter how correct the
+-- policies are — and the policies here are the entire security story, so they
+-- need to be the thing that actually runs.
+--
+-- Granted explicitly rather than with GRANT ... ON ALL TABLES. Two tables must
+-- never be readable by any client under any circumstances, and a blanket grant
+-- would hand them over while leaving RLS as the only thing standing in the way.
+-- Defence in depth means the grant should also be wrong to have.
+--
+-- Runs after 0002, which revokes UPDATE and DELETE on the audit tables. Nothing
+-- here re-grants them.
+
+grant usage on schema public to anon, authenticated;
+
+-- Reads. Every one of these is row-filtered by a policy in 0003 or 0006.
+grant select on
+  organisations,
+  profiles,
+  deliveries,
+  delivery_events,
+  shifts,
+  rider_positions,
+  position_history,
+  proof_artifacts,
+  tracking_tokens,
+  sap_sync_queue,
+  transition_rules,
+  tracking_sessions
+to authenticated;
+
+-- Writes, each matching an INSERT or UPDATE policy that scopes it.
+--   shifts            a rider opens their own and closes it
+--   rider_positions   upserted while on shift, deleted when the shift ends
+--   position_history  breadcrumb segments for the rider's own deliveries
+--   proof_artifacts   Tier 3 evidence, insert-only by design
+--   deliveries        admins set assignment fields; status is trigger-guarded
+grant insert, update on shifts to authenticated;
+grant insert, update, delete on rider_positions to authenticated;
+grant insert on position_history to authenticated;
+grant insert on proof_artifacts to authenticated;
+grant update on deliveries to authenticated;
+
+-- Sequences backing the bigserial keys, or inserts fail on nextval().
+grant usage on sequence delivery_events_id_seq to authenticated;
+grant usage on sequence position_history_id_seq to authenticated;
+
+-- DELIBERATELY NOT GRANTED, to any client role:
+--
+--   confirmation_pins  holds the PIN hash. §3.5 states "None" for every column.
+--                      Verification happens inside verify_confirmation_pin().
+--   outbound_sms       holds the PIN plaintext until the worker sends it.
+--   geocode_cache      written and read by server-side code only.
+--
+-- These have no policy either, so they are default-denied twice over.
 
