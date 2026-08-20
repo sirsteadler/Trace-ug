@@ -22,11 +22,20 @@
 
 | Gap | Consequence |
 |---|---|
-| **SMS worker Edge Function** | `outbound_sms` rows accumulate and nothing sends them. **Tier 2 confirmation does not reach the recipient.** |
-| **Supabase Auth SMS provider** | Phone OTP login does not work at all until an SMS provider is configured in the Supabase dashboard. This blocks every login. |
 | **SAP ByDesign adapter** | No import, no write-back. §08 of the concept note declares this honestly as mock-backed; the mock is also not written yet. |
 | **Server-side geocoding** | `destination_lat/lng` are never populated, so **`DELIVERED` cannot pass the geofence check** — `DESTINATION_NOT_GEOCODED` is raised. Deliveries can be created and carried but not closed. |
 | **Web Push** | Riders are not notified of new assignments; they see them on next open. |
+
+### SMS — built, but needs an account
+
+`send-sms-hook` and `sms-worker` are written. Twilio, the obvious provider,
+**offers no trial in Uganda**, so there are three paths:
+
+| Option | Effort | Notes |
+|---|---|---|
+| **Vonage** | Dashboard only | Native Supabase provider, trial credit valid for Uganda. Fastest route to working logins. The hook is bypassed entirely. |
+| **Africa's Talking** | Set 3 secrets | Cheapest per message, best Ugandan deliverability. An alphanumeric sender ID needs approval, which takes days — start the account early. |
+| **Console provider** | Nothing | Active automatically when no credentials are set. Logs what it would send. Development and offline demos only. |
 
 **The geocoding gap is the one that stops a demo.** Until addresses are geocoded, no delivery can be completed. Either build the geocoding step, or seed `destination_lat/lng` directly for demo records.
 
@@ -42,7 +51,42 @@ Blocking. Nothing below works until these are done.
    - Application restrictions: HTTP referrers → your Vercel domain and `http://localhost:3000/*`
    - API restrictions: Maps JavaScript API only
 4. **Create a second Maps key for the server**, restricted to Geocoding and Routes, no referrer restriction. Never give it a `NEXT_PUBLIC_` prefix.
-5. **Configure an SMS provider** in Supabase → Authentication → Providers → Phone. Twilio works natively. Africa's Talking requires the Send SMS auth hook pointed at an Edge Function, which is not yet written.
+5. **Configure an SMS provider.** Either:
+
+   **Vonage (fastest):** Supabase → Authentication → Providers → Phone → enable → choose Vonage → enter API key, API secret and from-number. Done; the hook is unused.
+
+   **Africa's Talking (cheapest):** deploy the functions and set their secrets:
+
+   ```bash
+   cd trace
+   npx supabase functions deploy send-sms-hook
+   npx supabase functions deploy sms-worker
+   npx supabase secrets set AT_USERNAME=your-at-username AT_API_KEY=your-at-key
+   ```
+
+   Then Supabase → Authentication → Hooks → **Send SMS hook** → enable, point it
+   at `https://<project-ref>.supabase.co/functions/v1/send-sms-hook`, copy the
+   generated secret, and set it:
+
+   ```bash
+   npx supabase secrets set SEND_SMS_HOOK_SECRET=v1,whsec_...
+   ```
+
+   Schedule the Tier 2 worker (SQL editor, once):
+
+   ```sql
+   select vault.create_secret('sb_secret_...', 'supabase_secret_key');
+
+   select cron.schedule('drain-outbound-sms', '* * * * *', $$
+     select net.http_post(
+       url := 'https://<project-ref>.supabase.co/functions/v1/sms-worker',
+       headers := jsonb_build_object(
+         'Content-Type', 'application/json',
+         'apikey', (select decrypted_secret from vault.decrypted_secrets
+                     where name = 'supabase_secret_key'))
+     );
+   $$);
+   ```
 
 ---
 
