@@ -412,3 +412,13 @@ enabled = true
 # declarative_schema_path = "./schemas"
 # JSON string passed through to pg-delta SQL formatting.
 # format_options = "{\"keywordCase\":\"upper\",\"indent\":2,\"maxWidth\":80,\"commaStyle\":\"trailing\"}"
+
+# Supabase Auth signs this hook with a shared secret rather than sending an API
+# key, so the platform JWT check would reject its own call before the handler
+# ran. The function verifies the Standard Webhooks signature itself.
+[functions.send-sms-hook]
+verify_jwt = false
+
+# Called by pg_cron via pg_net with the secret key in the apikey header.
+[functions.sms-worker]
+verify_jwt = false
