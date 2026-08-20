@@ -43,6 +43,7 @@ export default function WallboardPage() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void load();
     const poll = setInterval(() => void load(), POLL_MS);
 

@@ -18,8 +18,7 @@ import 'server-only';
  */
 import { createClient } from '@supabase/supabase-js';
 
-function requiredEnv(name: string): string {
-  const value = process.env[name];
+function requiredEnv(value: string | undefined, name: string): string {
   if (!value) throw new Error(`${name} is not set`);
   return value;
 }
@@ -49,8 +48,8 @@ export async function resolveTrackingLink(rawToken: string): Promise<TrackingLin
   if (!rawToken || rawToken.length < 20) return { state: 'invalid' };
 
   const supabase = createClient(
-    requiredEnv('NEXT_PUBLIC_SUPABASE_URL'),
-    requiredEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY'),
+    requiredEnv(process.env.NEXT_PUBLIC_SUPABASE_URL, 'NEXT_PUBLIC_SUPABASE_URL'),
+    requiredEnv(process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY, 'NEXT_PUBLIC_SUPABASE_ANON_KEY'),
     { auth: { persistSession: false } },
   );
 

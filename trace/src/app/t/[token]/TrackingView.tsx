@@ -117,6 +117,7 @@ export function TrackingView({ token }: { token: string }) {
 
   useEffect(() => {
     if (!deliveryId) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void load();
 
     const channel = supabase

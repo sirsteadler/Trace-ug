@@ -14,8 +14,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 let cached: SupabaseClient | null = null;
 
-function readEnv(name: string): string {
-  const value = process.env[name];
+function readEnv(value: string | undefined, name: string): string {
   if (typeof value !== 'string' || value.length === 0) {
     // Fail loudly at the boundary rather than producing a client that 401s
     // on every call and looks like an auth bug.
@@ -28,8 +27,8 @@ function readEnv(name: string): string {
 
 export function supabase(): SupabaseClient {
   cached ??= createBrowserClient(
-    readEnv('NEXT_PUBLIC_SUPABASE_URL'),
-    readEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY'),
+    readEnv(process.env.NEXT_PUBLIC_SUPABASE_URL, 'NEXT_PUBLIC_SUPABASE_URL'),
+    readEnv(process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY, 'NEXT_PUBLIC_SUPABASE_ANON_KEY'),
   );
   return cached;
 }

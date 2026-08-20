@@ -11,7 +11,6 @@
  */
 import {
   MapUnavailableError,
-  type LatLng,
   type MapHandle,
   type MapProvider,
   type MarkerKind,

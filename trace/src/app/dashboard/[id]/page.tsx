@@ -80,6 +80,7 @@ export default function DeliveryDetailPage({
   }, [id]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void load();
 
     const channel = supabase()
