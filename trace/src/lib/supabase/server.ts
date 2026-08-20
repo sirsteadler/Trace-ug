@@ -17,8 +17,7 @@ import { createServerClient } from '@supabase/ssr';
 import { cookies } from 'next/headers';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-function readEnv(name: string): string {
-  const value = process.env[name];
+function readEnv(value: string | undefined, name: string): string {
   if (typeof value !== 'string' || value.length === 0) {
     throw new Error(
       `${name} is not set. Copy .env.local.example to .env.local and fill it in.`,
@@ -31,8 +30,8 @@ export async function supabaseServer(): Promise<SupabaseClient> {
   const store = await cookies();
 
   return createServerClient(
-    readEnv('NEXT_PUBLIC_SUPABASE_URL'),
-    readEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY'),
+    readEnv(process.env.NEXT_PUBLIC_SUPABASE_URL, 'NEXT_PUBLIC_SUPABASE_URL'),
+    readEnv(process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY, 'NEXT_PUBLIC_SUPABASE_ANON_KEY'),
     {
       cookies: {
         getAll() {
