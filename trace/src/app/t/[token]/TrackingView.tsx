@@ -10,12 +10,17 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
+import { DeliveryMap } from '@/components/map/DeliveryMap';
+import type { LatLng } from '@/lib/map';
 
 interface Delivery {
   id: string;
   trace_id: string;
   status: string;
   destination_address: string | null;
+  destination_lat: number | null;
+  destination_lng: number | null;
+  geofence_radius_m: number | null;
   eta_at: string | null;
 }
 
@@ -46,7 +51,7 @@ export function TrackingView({ token }: { token: string }) {
 
   const [deliveryId, setDeliveryId] = useState<string | null>(null);
   const [delivery, setDelivery] = useState<Delivery | null>(null);
-  const [riderMoving, setRiderMoving] = useState(false);
+  const [riderPosition, setRiderPosition] = useState<LatLng | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fatal, setFatal] = useState<string | null>(null);
@@ -90,12 +95,24 @@ export function TrackingView({ token }: { token: string }) {
 
   const load = useCallback(async () => {
     if (!deliveryId) return;
-    const { data } = await supabase
-      .from('deliveries')
-      .select('id, trace_id, status, destination_address, eta_at')
-      .eq('id', deliveryId)
-      .maybeSingle();
+
+    const [{ data }, { data: position }] = await Promise.all([
+      supabase
+        .from('deliveries')
+        .select(
+          'id, trace_id, status, destination_address, destination_lat, destination_lng, geofence_radius_m, eta_at',
+        )
+        .eq('id', deliveryId)
+        .maybeSingle(),
+      // RLS returns this only while the delivery is in a state the recipient
+      // may watch, so no state check is needed here.
+      supabase.from('rider_positions').select('lat, lng').maybeSingle(),
+    ]);
+
     if (data) setDelivery(data as Delivery);
+    if (position) {
+      setRiderPosition({ lat: Number(position.lat), lng: Number(position.lng) });
+    }
   }, [supabase, deliveryId]);
 
   useEffect(() => {
@@ -117,10 +134,13 @@ export function TrackingView({ token }: { token: string }) {
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'rider_positions' },
-        () => {
+        (payload) => {
           // RLS limits this to the rider on this delivery, and only while the
           // delivery is in a state the recipient may watch.
-          setRiderMoving(true);
+          const row = payload.new as { lat?: number; lng?: number } | null;
+          if (row?.lat != null && row?.lng != null) {
+            setRiderPosition({ lat: Number(row.lat), lng: Number(row.lng) });
+          }
         },
       )
       .subscribe();
@@ -203,14 +223,21 @@ export function TrackingView({ token }: { token: string }) {
         </p>
       )}
 
-      {delivery.destination_address && (
-        <p className="wrap-hard mt-6 text-sm text-mist-400">{delivery.destination_address}</p>
+      {!done && (
+        <DeliveryMap
+          className="mt-6 h-64"
+          destination={
+            delivery.destination_lat != null && delivery.destination_lng != null
+              ? { lat: Number(delivery.destination_lat), lng: Number(delivery.destination_lng) }
+              : null
+          }
+          rider={riderPosition}
+          geofenceRadiusM={delivery.geofence_radius_m ?? undefined}
+        />
       )}
 
-      {riderMoving && !done && (
-        <p className="mt-6 rounded-xl bg-ink-800 px-4 py-3 text-sm text-mist-200">
-          Rider position updating live
-        </p>
+      {delivery.destination_address && (
+        <p className="wrap-hard mt-4 text-sm text-mist-400">{delivery.destination_address}</p>
       )}
 
       {error && (
